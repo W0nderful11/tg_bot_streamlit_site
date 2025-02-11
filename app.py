@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import re
 from collections import Counter
+from wordcloud import WordCloud
+import pandas as pd
 
 # ---------------------------
 # ChromaDB and Embedding Setup
@@ -26,6 +28,7 @@ os.makedirs(DB_DIRECTORY, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=DB_DIRECTORY)
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
+
 class ChromaDBEmbeddingFunction:
     def __init__(self, embedding_model):
         self.embedding_model = embedding_model
@@ -34,6 +37,7 @@ class ChromaDBEmbeddingFunction:
         if isinstance(input, str):
             input = [input]
         return self.embedding_model.encode(input).tolist()
+
 
 embedding = ChromaDBEmbeddingFunction(embedding_model)
 
@@ -48,14 +52,17 @@ except UniqueConstraintError:
 
 MODEL_NAME = "llama3.2"
 
+
 # ---------------------------
 # Helper Functions
 # ---------------------------
 def compute_hash(content):
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
+
 def add_documents(documents, ids):
     collection.add(documents=documents, ids=ids)
+
 
 def query_documents(query_text, n_results=None):
     if n_results is None:
@@ -64,9 +71,11 @@ def query_documents(query_text, n_results=None):
     results = collection.query(query_texts=[query_text], n_results=n_results)
     return results["documents"]
 
+
 def ollama_generate(prompt):
     llm = OllamaLLM(model=MODEL_NAME)
     return llm.invoke(prompt)
+
 
 async def scrape_page(url):
     try:
@@ -79,9 +88,11 @@ async def scrape_page(url):
     except Exception as e:
         return f"Error scraping {url}: {str(e)}"
 
+
 async def scrape_pages(urls):
     tasks = [scrape_page(url) for url in urls]
     return await asyncio.gather(*tasks)
+
 
 def extract_keywords(query, top_n=5):
     vectorizer = TfidfVectorizer(stop_words="english")
@@ -90,6 +101,7 @@ def extract_keywords(query, top_n=5):
     tfidf_scores = tfidf.toarray()[0]
     top_indices = np.argsort(tfidf_scores)[-top_n:][::-1]
     return [feature_names[i] for i in top_indices]
+
 
 @st.cache_data
 def search_duckduckgo(query, max_results=5):
@@ -118,6 +130,7 @@ def search_duckduckgo(query, max_results=5):
     except Exception as e:
         return [], []
 
+
 def process_uploaded_file(uploaded_file):
     if uploaded_file.type == "application/pdf":
         reader = PdfReader(uploaded_file)
@@ -127,6 +140,7 @@ def process_uploaded_file(uploaded_file):
     else:
         text = None
     return text
+
 
 def upload_file():
     uploaded_file = st.file_uploader("Upload PDF or TXT file", type=["pdf", "txt"])
@@ -154,12 +168,14 @@ def upload_file():
         except Exception as e:
             st.error(f"Error processing file: {e}")
 
+
 # ---------------------------
 # RAG Pipeline Functions
 # ---------------------------
 def query_chromadb(query_text, n_results=1):
     results = collection.query(query_texts=[query_text], n_results=n_results)
     return results["documents"], results.get("metadatas", [])
+
 
 def rag_pipeline(query_text):
     retrieved_docs, metadata = query_chromadb(query_text)
@@ -170,6 +186,7 @@ def rag_pipeline(query_text):
     augmented_prompt = f"Context: {context}\n\nQuestion: {query_text}\nAnswer:"
     response = ollama_generate(augmented_prompt)
     return response
+
 
 def query_processor(user_query, use_web_search=False):
     try:
@@ -185,6 +202,18 @@ def query_processor(user_query, use_web_search=False):
     except Exception as e:
         return f"Error: {str(e)}", []
 
+
+# ---------------------------
+# Word Cloud Visualization
+# ---------------------------
+def generate_word_cloud(text):
+    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
+    plt.figure(figsize=(10, 5))
+    plt.imshow(wordcloud, interpolation='bilinear')
+    plt.axis('off')
+    st.pyplot(plt)
+
+
 # ---------------------------
 # Main Streamlit App
 # ---------------------------
@@ -192,7 +221,7 @@ def main():
     st.title("AI-Powered Chatbot")
 
     # Sidebar navigation
-    menu = ["Home", "View Documents", "Add Document", "Ask Ollama"]
+    menu = ["Home", "View Documents", "Add Document", "Ask Ollama", "Visualizations"]
     choice = st.sidebar.selectbox("Navigation", menu)
 
     if choice == "Home":
@@ -201,16 +230,16 @@ def main():
             """
             Welcome to **AI OllamaLLM-based chatbot**, a collaborative platform designed to help you 
             store, explore, and interact with knowledge efficiently.
-            
+
             **What You Can Do Here**  
             - 📂 **Upload Documents** – Add PDFs, text files, or web links to the knowledge base.  
             - 🤖 **Ask AI-Powered Questions** – Get instant insights using advanced AI models.  
             - 📊 **Visualize Data** – Discover trends with interactive graphs, word clouds, and topic models.  
             - 🛠 **Collaborate & Improve** – Suggest edits, contribute knowledge, and enhance the database together.  
-            
+
             **Get Started**  
             Simply **upload a document** or **ask a question**, and let AI assist you.  
-            
+
             Ready to explore? **Start now!** 🚀  
             """
         )
@@ -297,6 +326,17 @@ def main():
                     for meta in metadata:
                         with st.expander(f"Source: {meta.get('source', 'Unknown source')}"):
                             st.write(meta.get("content", "No content extracted"))
+
+    elif choice == "Visualizations":
+        st.subheader("Data Visualizations")
+        docs = collection.get()
+        if docs['documents']:
+            all_text = " ".join(docs['documents'])
+            st.write("### Word Cloud")
+            generate_word_cloud(all_text)
+        else:
+            st.warning("No documents found for visualization.")
+
 
 if __name__ == "__main__":
     main()

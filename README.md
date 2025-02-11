@@ -47,6 +47,8 @@
 
    ```bash
    streamlit run main.py
+   python bot.py
+
    ```
 
 ---

@@ -1,5 +1,6 @@
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackContext
+from telegram.ext import filters
 import os
 import hashlib
 import asyncio
@@ -87,7 +88,6 @@ async def search_duckduckgo(query, max_results=5):
     try:
         results = DDGS().text(query, max_results=max_results)
         urls = [result['href'] for result in results if 'href' in result]
-        # Используем await для асинхронного выполнения
         contents = await scrape_pages(urls)
         content_list = []
         metadata_list = []
@@ -97,7 +97,6 @@ async def search_duckduckgo(query, max_results=5):
                 "content": content
             })
             content_list.append(content)
-            # Опционально добавляем данные в коллекцию
             collection.add(
                 documents=[content],
                 metadatas=[{"url": urls[i]}],
@@ -107,36 +106,93 @@ async def search_duckduckgo(query, max_results=5):
     except Exception as e:
         return [], []
 
+async def document_handler(update: Update, context: CallbackContext):
+    if update.message.document:
+        document = update.message.document
+        try:
+            file = await document.get_file()
+            file_path = f"{document.file_name}"
+            await file.download_to_drive(file_path)
+
+            print("Файл успешно загружен.")  # Отладка
+            await update.message.reply_text("Файл успешно загружен. Обрабатываем...")
+        except Exception as e:
+            print(f"Ошибка: {e}")  # Отладка
+            await update.message.reply_text(f"Ошибка при обработке файла: {e}")
+    else:
+        print("Сообщение не содержит файл.")  # Отладка
+        await update.message.reply_text("Пожалуйста, отправьте файл для обработки.")
+
+
 def process_uploaded_file(file_path):
     if file_path.lower().endswith(".pdf"):
         reader = PdfReader(file_path)
-        text = "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+        pages_text = [page.extract_text() for page in reader.pages if page.extract_text()]
+        text = "\n".join(pages_text)
+        page_count = len(pages_text)
+        return text, page_count
     elif file_path.lower().endswith(".txt"):
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
+        return text, None
     else:
-        text = None
-    return text
+        return None, None
 
-def upload_file_from_path(file_path):
-    text_content = process_uploaded_file(file_path)
-    if text_content:
-        doc_hash = compute_hash(text_content)
-        existing_docs = collection.get()
-        existing_hashes = [compute_hash(doc) for doc in existing_docs["documents"]]
-        if doc_hash in existing_hashes:
-            return "This document is already in the database."
-        else:
-            doc_id = f"doc{len(existing_docs['documents']) + 1}"
-            embeddings = embedding([text_content])[0]
-            collection.add(
-                ids=[doc_id],
-                documents=[text_content],
-                embeddings=[embeddings]
-            )
-            return f"File processed and saved with ID: {doc_id}"
+async def upload_command(update: Update, context: CallbackContext):
+    if update.message.document:
+        document = update.message.document
+        try:
+            file = await document.get_file()
+            file_path = f"{document.file_name}"
+            await file.download_to_drive(file_path)
+
+            print("Файл успешно загружен, начинаем обработку...")  # Отладка
+            await update.message.reply_text("Файл успешно загружен. Обрабатываем...")
+
+            # Извлечение текста и количества страниц
+            text_content, page_count = process_uploaded_file(file_path)
+            if text_content:
+                print(f"Извлечённый текст: {text_content[:500]}...")  # Отладка
+                print(f"Количество страниц: {page_count}")  # Отладка
+
+                # Проверка на дубликаты
+                doc_hash = compute_hash(text_content)
+                existing_docs = collection.get()
+                existing_hashes = [compute_hash(doc) for doc in existing_docs["documents"]]
+                if doc_hash in existing_hashes:
+                    print("Документ уже есть в базе данных.")  # Отладка
+                    await update.message.reply_text("Этот документ уже есть в базе данных.")
+                else:
+                    # Сохранение нового документа
+                    doc_id = f"doc{len(existing_docs['documents']) + 1}"
+                    embeddings = embedding([text_content])[0]
+                    collection.add(
+                        ids=[doc_id],
+                        documents=[text_content],
+                        embeddings=[embeddings]
+                    )
+                    print(f"Файл сохранён с ID: {doc_id}")  # Отладка
+                    if page_count:
+                        await update.message.reply_text(
+                            f"Файл обработан и сохранен с ID: {doc_id}\nPDF содержит {page_count} страниц(ы)."
+                        )
+                    else:
+                        await update.message.reply_text(f"Файл обработан и сохранен с ID: {doc_id}")
+            else:
+                print("Файл пуст или неподдерживаемый тип.")  # Отладка
+                await update.message.reply_text("Неподдерживаемый тип файла или файл пуст.")
+        except Exception as e:
+            print(f"Ошибка при загрузке файла: {str(e)}")  # Отладка
+            await update.message.reply_text(f"Произошла ошибка при загрузке файла: {str(e)}")
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
     else:
-        return "Unsupported file type or empty file."
+        print("Файл не был отправлен.")  # Отладка
+        await update.message.reply_text("Пожалуйста, отправьте файл для загрузки.")
+
+
+
 
 def query_chromadb(query_text, n_results=1):
     results = collection.query(query_texts=[query_text], n_results=n_results)
@@ -155,18 +211,15 @@ def rag_pipeline(query_text):
 async def query_processor(user_query, use_web_search=False):
     try:
         if use_web_search:
-            # Выполняем веб-поиск
             search_results, metadata = await search_duckduckgo(user_query)
             context = "\n".join(search_results) if search_results else "No web results found."
             response = ollama_generate(f"Context: {context}\n\nQuestion: {user_query}\nAnswer:")
             return response, metadata
         else:
-            # Используем локальный RAG-пайплайн
             response = rag_pipeline(user_query)
             return response, []
     except Exception as e:
         return f"Error: {str(e)}", []
-
 
 # ---------------------------
 # Telegram Bot Handlers
@@ -181,27 +234,23 @@ async def start(update: Update, context: CallbackContext):
         "/pca - Generate PCA visualization of stored document word embeddings"
     )
 
-
 async def chat_command(update: Update, context: CallbackContext):
     user_query = " ".join(context.args)
     if user_query:
-        response, _ = query_processor(user_query, use_web_search=False)
+        response, _ = await query_processor(user_query, use_web_search=False)
         await update.message.reply_text(response)
     else:
         await update.message.reply_text("Please provide a question after /chat.")
 
-
-async def web_command(update, context):
+async def web_command(update: Update, context: CallbackContext):
     try:
         user_query = " ".join(context.args)
         if not user_query:
             await update.message.reply_text("Please provide a search query.")
             return
 
-        # Добавляем await, чтобы дождаться выполнения query_processor
         response, metadata = await query_processor(user_query, use_web_search=True)
 
-        # Форматируем ответ для пользователя
         result_message = f"Response:\n{response}\n\nSources:\n"
         for meta in metadata:
             result_message += f"- {meta['source']}\n"
@@ -209,17 +258,6 @@ async def web_command(update, context):
         await update.message.reply_text(result_message)
     except Exception as e:
         await update.message.reply_text(f"An error occurred: {str(e)}")
-
-
-
-async def upload_command(update: Update, context: CallbackContext):
-    file_path = " ".join(context.args)
-    if file_path:
-        result = upload_file_from_path(file_path)
-        await update.message.reply_text(result)
-    else:
-        await update.message.reply_text("Please provide the file path after /upload.")
-
 
 async def pca_command(update: Update, context: CallbackContext):
     docs = collection.get()
@@ -255,52 +293,18 @@ async def pca_command(update: Update, context: CallbackContext):
     os.remove(plot_filename)
 
 
-    # Combine all stored documents' text
-    all_text = " ".join(docs["documents"])
-    # Extract words using regex (convert to lowercase)
-    words = re.findall(r'\w+', all_text.lower())
-    # Get the top 100 most common words
-    word_counts = Counter(words)
-    top_words = [word for word, count in word_counts.most_common(100)]
-    if not top_words:
-        update.message.reply_text("No words found for PCA visualization.")
-        return
-
-    # Compute embeddings for the selected words
-    word_embeddings = embedding(top_words)
-    # Apply PCA to reduce dimensions to 2D
-    pca = PCA(n_components=2)
-    reduced = pca.fit_transform(word_embeddings)
-
-    # Create scatter plot with annotations
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.scatter(reduced[:, 0], reduced[:, 1], alpha=0.7)
-    for i, word in enumerate(top_words):
-        ax.annotate(word, (reduced[i, 0], reduced[i, 1]), fontsize=8)
-    ax.set_title("PCA Visualization of Word Embeddings")
-
-    # Save the plot to a temporary file
-    plot_filename = "pca_plot.png"
-    fig.savefig(plot_filename)
-    plt.close(fig)
-
-    # Send the image back to the user
-    with open(plot_filename, "rb") as photo:
-        update.message.reply_photo(photo=photo, caption="PCA Visualization of Word Embeddings")
-    os.remove(plot_filename)
-
 def main():
     application = Application.builder().token("7457156728:AAE-x8buJY1I84ieH24HjFJxkh2j7T0ZECA").build()
 
-    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("chat", chat_command))
     application.add_handler(CommandHandler("web", web_command))
-    application.add_handler(CommandHandler("upload", upload_command))
+    application.add_handler(CommandHandler("upload", upload_command))  # Команда для явной загрузки
     application.add_handler(CommandHandler("pca", pca_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))  # Обработчик для документов
 
-    # Запуск бота
     application.run_polling()
+
 
 if __name__ == '__main__':
     main()

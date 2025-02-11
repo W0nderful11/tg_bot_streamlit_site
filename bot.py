@@ -1,5 +1,5 @@
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackContext
 import os
 import hashlib
 import asyncio
@@ -74,6 +74,7 @@ async def scrape_pages(urls):
     tasks = [scrape_page(url) for url in urls]
     return await asyncio.gather(*tasks)
 
+@staticmethod
 def extract_keywords(query, top_n=5):
     vectorizer = TfidfVectorizer(stop_words="english")
     tfidf = vectorizer.fit_transform([query])
@@ -82,11 +83,12 @@ def extract_keywords(query, top_n=5):
     top_indices = np.argsort(tfidf_scores)[-top_n:][::-1]
     return [feature_names[i] for i in top_indices]
 
-def search_duckduckgo(query, max_results=5):
+async def search_duckduckgo(query, max_results=5):
     try:
         results = DDGS().text(query, max_results=max_results)
         urls = [result['href'] for result in results if 'href' in result]
-        contents = asyncio.run(scrape_pages(urls))
+        # Используем await для асинхронного выполнения
+        contents = await scrape_pages(urls)
         content_list = []
         metadata_list = []
         for i, content in enumerate(contents):
@@ -95,6 +97,7 @@ def search_duckduckgo(query, max_results=5):
                 "content": content
             })
             content_list.append(content)
+            # Опционально добавляем данные в коллекцию
             collection.add(
                 documents=[content],
                 metadatas=[{"url": urls[i]}],
@@ -149,23 +152,26 @@ def rag_pipeline(query_text):
     response = ollama_generate(augmented_prompt)
     return response
 
-def query_processor(user_query, use_web_search=False):
+async def query_processor(user_query, use_web_search=False):
     try:
         if use_web_search:
-            search_results, metadata = search_duckduckgo(user_query)
+            # Выполняем веб-поиск
+            search_results, metadata = await search_duckduckgo(user_query)
             context = "\n".join(search_results) if search_results else "No web results found."
             response = ollama_generate(f"Context: {context}\n\nQuestion: {user_query}\nAnswer:")
             return response, metadata
         else:
+            # Используем локальный RAG-пайплайн
             response = rag_pipeline(user_query)
             return response, []
     except Exception as e:
         return f"Error: {str(e)}", []
 
+
 # ---------------------------
 # Telegram Bot Handlers
 # ---------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(
         "Welcome to the AI Chatbot!\n"
         "Commands:\n"
@@ -175,7 +181,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pca - Generate PCA visualization of stored document word embeddings"
     )
 
-async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def chat_command(update: Update, context: CallbackContext):
     user_query = " ".join(context.args)
     if user_query:
         response, _ = query_processor(user_query, use_web_search=False)
@@ -183,19 +190,29 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Please provide a question after /chat.")
 
-async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_query = " ".join(context.args)
-    if user_query:
-        response, metadata = query_processor(user_query, use_web_search=True)
-        reply = f"{response}\n"
-        if metadata:
-            sources = "\n".join(meta.get("source", "Unknown source") for meta in metadata)
-            reply += f"\nSources:\n{sources}"
-        await update.message.reply_text(reply)
-    else:
-        await update.message.reply_text("Please provide a query after /web.")
 
-async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def web_command(update, context):
+    try:
+        user_query = " ".join(context.args)
+        if not user_query:
+            await update.message.reply_text("Please provide a search query.")
+            return
+
+        # Добавляем await, чтобы дождаться выполнения query_processor
+        response, metadata = await query_processor(user_query, use_web_search=True)
+
+        # Форматируем ответ для пользователя
+        result_message = f"Response:\n{response}\n\nSources:\n"
+        for meta in metadata:
+            result_message += f"- {meta['source']}\n"
+
+        await update.message.reply_text(result_message)
+    except Exception as e:
+        await update.message.reply_text(f"An error occurred: {str(e)}")
+
+
+
+async def upload_command(update: Update, context: CallbackContext):
     file_path = " ".join(context.args)
     if file_path:
         result = upload_file_from_path(file_path)
@@ -203,18 +220,8 @@ async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Please provide the file path after /upload.")
 
-async def view_docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    docs = collection.get()
-    if not docs["documents"]:
-        await update.message.reply_text("No documents found in the database.")
-        return
 
-    reply = "List of uploaded documents:\n\n"
-    for i, doc in enumerate(docs["documents"]):
-        reply += f"{i + 1}. {doc[:100]}...\n"
-    await update.message.reply_text(reply)
-
-async def pca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def pca_command(update: Update, context: CallbackContext):
     docs = collection.get()
     if not docs["documents"]:
         await update.message.reply_text("No documents found to generate PCA visualization.")
@@ -224,6 +231,7 @@ async def pca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words = re.findall(r'\w+', all_text.lower())
     word_counts = Counter(words)
     top_words = [word for word, count in word_counts.most_common(100)]
+
     if not top_words:
         await update.message.reply_text("No words found for PCA visualization.")
         return
@@ -246,20 +254,53 @@ async def pca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(photo=photo, caption="PCA Visualization of Word Embeddings")
     os.remove(plot_filename)
 
-# ---------------------------
-# Main Function
-# ---------------------------
+
+    # Combine all stored documents' text
+    all_text = " ".join(docs["documents"])
+    # Extract words using regex (convert to lowercase)
+    words = re.findall(r'\w+', all_text.lower())
+    # Get the top 100 most common words
+    word_counts = Counter(words)
+    top_words = [word for word, count in word_counts.most_common(100)]
+    if not top_words:
+        update.message.reply_text("No words found for PCA visualization.")
+        return
+
+    # Compute embeddings for the selected words
+    word_embeddings = embedding(top_words)
+    # Apply PCA to reduce dimensions to 2D
+    pca = PCA(n_components=2)
+    reduced = pca.fit_transform(word_embeddings)
+
+    # Create scatter plot with annotations
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.scatter(reduced[:, 0], reduced[:, 1], alpha=0.7)
+    for i, word in enumerate(top_words):
+        ax.annotate(word, (reduced[i, 0], reduced[i, 1]), fontsize=8)
+    ax.set_title("PCA Visualization of Word Embeddings")
+
+    # Save the plot to a temporary file
+    plot_filename = "pca_plot.png"
+    fig.savefig(plot_filename)
+    plt.close(fig)
+
+    # Send the image back to the user
+    with open(plot_filename, "rb") as photo:
+        update.message.reply_photo(photo=photo, caption="PCA Visualization of Word Embeddings")
+    os.remove(plot_filename)
+
 def main():
     application = Application.builder().token("7457156728:AAE-x8buJY1I84ieH24HjFJxkh2j7T0ZECA").build()
 
+    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("chat", chat_command))
     application.add_handler(CommandHandler("web", web_command))
     application.add_handler(CommandHandler("upload", upload_command))
-    application.add_handler(CommandHandler("view_docs", view_docs_command))
     application.add_handler(CommandHandler("pca", pca_command))
 
+    # Запуск бота
     application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

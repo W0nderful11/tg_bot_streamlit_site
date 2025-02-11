@@ -107,6 +107,7 @@ async def search_duckduckgo(query, max_results=5):
         return [], []
 
 async def document_handler(update: Update, context: CallbackContext):
+    """Обрабатывает документ, извлекает текст, сохраняет эмбеддинги и ID."""
     if update.message.document:
         document = update.message.document
         try:
@@ -114,14 +115,53 @@ async def document_handler(update: Update, context: CallbackContext):
             file_path = f"{document.file_name}"
             await file.download_to_drive(file_path)
 
-            print("Файл успешно загружен.")  # Отладка
-            await update.message.reply_text("Файл успешно загружен. Обрабатываем...")
+            # Извлечение текста и количества страниц
+            text_content, page_count = process_uploaded_file(file_path)
+
+            if text_content:
+                # Проверка на дубликаты
+                doc_hash = compute_hash(text_content)
+                existing_docs = collection.get()
+                existing_hashes = [compute_hash(doc) for doc in existing_docs.get("documents", [])]
+
+                if doc_hash in existing_hashes:
+                    await update.message.reply_text(
+                        "\u26a0\ufe0f Этот документ уже есть в базе данных."
+                    )
+                else:
+                    # Сохранение нового документа
+                    doc_id = f"doc{len(existing_docs.get('documents', [])) + 1}"
+                    embeddings = embedding([text_content])[0]
+
+                    collection.add(
+                        ids=[doc_id],
+                        documents=[text_content],
+                        embeddings=[embeddings]
+                    )
+
+                    # Уведомление пользователя
+                    await update.message.reply_text(
+                        f"\u2705 Файл успешно загружен и сохранён в базе данных с ID: {doc_id}"
+                    )
+            else:
+                await update.message.reply_text(
+                    "\u26a0\ufe0f Неподдерживаемый тип файла или файл пуст."
+                )
+
         except Exception as e:
-            print(f"Ошибка: {e}")  # Отладка
-            await update.message.reply_text(f"Ошибка при обработке файла: {e}")
+            await update.message.reply_text(f"\u274c Ошибка: {str(e)}")
+        finally:
+            # Удаление временного файла
+            if os.path.exists(file_path):
+                os.remove(file_path)
     else:
-        print("Сообщение не содержит файл.")  # Отладка
-        await update.message.reply_text("Пожалуйста, отправьте файл для обработки.")
+        await update.message.reply_text("\u26a0\ufe0f Пожалуйста, отправьте файл для загрузки.")
+
+
+async def upload_command(update: Update, context: CallbackContext):
+    """Обрабатывает команду загрузки документа через /upload."""
+    await document_handler(update, context)
+
 
 
 def process_uploaded_file(file_path):
@@ -138,65 +178,10 @@ def process_uploaded_file(file_path):
     else:
         return None, None
 
-async def upload_command(update: Update, context: CallbackContext):
-    if update.message.document:
-        document = update.message.document
-        try:
-            file = await document.get_file()
-            file_path = f"{document.file_name}"
-            await file.download_to_drive(file_path)
-
-            print("Файл успешно загружен, начинаем обработку...")  # Отладка
-            await update.message.reply_text("Файл успешно загружен. Обрабатываем...")
-
-            # Извлечение текста и количества страниц
-            text_content, page_count = process_uploaded_file(file_path)
-            if text_content:
-                print(f"Извлечённый текст: {text_content[:500]}...")  # Отладка
-                print(f"Количество страниц: {page_count}")  # Отладка
-
-                # Проверка на дубликаты
-                doc_hash = compute_hash(text_content)
-                existing_docs = collection.get()
-                existing_hashes = [compute_hash(doc) for doc in existing_docs["documents"]]
-                if doc_hash in existing_hashes:
-                    print("Документ уже есть в базе данных.")  # Отладка
-                    await update.message.reply_text("Этот документ уже есть в базе данных.")
-                else:
-                    # Сохранение нового документа
-                    doc_id = f"doc{len(existing_docs['documents']) + 1}"
-                    embeddings = embedding([text_content])[0]
-                    collection.add(
-                        ids=[doc_id],
-                        documents=[text_content],
-                        embeddings=[embeddings]
-                    )
-                    print(f"Файл сохранён с ID: {doc_id}")  # Отладка
-                    if page_count:
-                        await update.message.reply_text(
-                            f"Файл обработан и сохранен с ID: {doc_id}\nPDF содержит {page_count} страниц(ы)."
-                        )
-                    else:
-                        await update.message.reply_text(f"Файл обработан и сохранен с ID: {doc_id}")
-            else:
-                print("Файл пуст или неподдерживаемый тип.")  # Отладка
-                await update.message.reply_text("Неподдерживаемый тип файла или файл пуст.")
-        except Exception as e:
-            print(f"Ошибка при загрузке файла: {str(e)}")  # Отладка
-            await update.message.reply_text(f"Произошла ошибка при загрузке файла: {str(e)}")
-        finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-    else:
-        print("Файл не был отправлен.")  # Отладка
-        await update.message.reply_text("Пожалуйста, отправьте файл для загрузки.")
-
-
-
 
 def query_chromadb(query_text, n_results=1):
     results = collection.query(query_texts=[query_text], n_results=n_results)
-    return results["documents"], results.get("metadatas", [])
+    return results[ "documents"], results.get("metadatas", [])
 
 def rag_pipeline(query_text):
     retrieved_docs, metadata = query_chromadb(query_text)
